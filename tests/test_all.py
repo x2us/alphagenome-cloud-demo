@@ -12,7 +12,11 @@ from godel_agent.harness import run_track          # noqa: E402
 from sais.anticheat import audit                    # noqa: E402
 from sais.ef1 import TargetScores, mean_ef1, enrichment_factor, ReferenceLeakageError  # noqa: E402
 from sais.log_truth import check as log_check       # noqa: E402
-from sais.utility import GateResult, evaluate       # noqa: E402
+from sais.utility import GateResult, evaluate, UtilityReport  # noqa: E402
+from sais.submission import lint_submission, is_valid_image_reference, extract_image_reference  # noqa: E402
+from sais.contract import check_mount_truth, check_run_sh, check_csv_artifact, ArtifactSpec  # noqa: E402
+from sais.release_card import ReleaseCard, check_release_card  # noqa: E402
+from sais.pipeline import Pipeline, Candidate, Decision  # noqa: E402
 
 
 # ---- Gödel toy reproduction ------------------------------------------------ #
@@ -97,6 +101,89 @@ def test_utility_clean_is_nonzero():
     )
     assert abs(report.utility - 0.7) < 1e-9
     assert not report.is_gated_zero
+
+
+# ---- 提交地址 linter（防 InvalidImageName 事故）---------------------------- #
+
+_T2 = ("crpi-rwdagqllzc5mssc6.cn-shanghai.personal.cr.aliyuncs.com/sais-cns-2026/"
+       "sais-cns-task2-molecule:sbdd-k64-pool8-t20-div035-mountwait-csvfix-20260619-r3")
+
+def test_clean_address_passes():
+    assert is_valid_image_reference(_T2)
+    assert lint_submission(_T2).ok
+
+def test_task_prefix_is_rejected_and_cleaned():
+    r = lint_submission("Task2  " + _T2)
+    assert not r.ok
+    assert any("前缀" in p for p in r.problems)
+    assert r.cleaned == _T2                    # 自动清洗回干净地址
+
+def test_backtick_wrapped_rejected():
+    r = lint_submission("`" + _T2 + "`")
+    assert not r.ok
+    assert extract_image_reference("`" + _T2 + "`") == _T2
+
+
+# ---- mount-truth / run.sh 门（Task1 真因）---------------------------------- #
+
+def test_mount_truth_catches_empty_mount_fallback():
+    g = check_mount_truth(saisdata_listing=[], used_baked_zip=True, fail_closed=False)
+    assert not g.passed                        # 空挂载偷跑烤入 zip -> 0 分真因
+
+def test_mount_truth_failclosed_ok():
+    g = check_mount_truth(saisdata_listing=[], used_baked_zip=True, fail_closed=True)
+    assert g.passed                            # 已 fail-closed，行为正确
+
+def test_run_sh_flags_unguarded_fallback():
+    bad = "cp /app/benchmark.zip /tmp/ && python run.py"
+    assert not check_run_sh(bad).passed
+    good = ("set -e\nuntil [ -n \"$(ls /saisdata)\" ]; do sleep 2; done\n"
+            "if [ -z \"$(ls /saisdata)\" ]; then exit 3; fi\npython run.py")
+    assert check_run_sh(good).passed
+
+
+# ---- 产物门 / release card / pipeline -------------------------------------- #
+
+def test_csv_artifact_detects_dups_and_missing_cols():
+    rows = [{"id": "A", "score": "0.9"}, {"id": "A", "score": "0.8"}]
+    g = check_csv_artifact(rows, ArtifactSpec(["id", "score", "smiles"], 5, id_column="id"))
+    assert not g.passed
+
+def test_release_card_requires_evidence():
+    assert not check_release_card(ReleaseCard()).passed
+    full = ReleaseCard(image_digest="sha256:" + "a"*64, image_reference=_T2,
+                       pullback_verified=True, smoke_passed=True,
+                       log_summary="ok", single_factor="mountwait")
+    assert check_release_card(full).passed
+
+def _good_card(ref=_T2, factor="mountwait"):
+    return ReleaseCard(image_digest="sha256:" + "a"*64, image_reference=ref,
+                       pullback_verified=True, smoke_passed=True,
+                       log_summary="ok", single_factor=factor)
+
+def test_pipeline_rejects_multifactor_and_admits_single():
+    p = Pipeline()
+    multi = Candidate("c1", "task1", None, "mountwait,boost-off",
+                      [GateResult("entry", True)], 5.0, _good_card())
+    assert p.review(multi).decision in (Decision.REJECT,)  # 多因子混合
+    single = Candidate("c2", "task1", None, "mountwait",
+                       [GateResult("entry", True)], 5.0, _good_card())
+    assert p.review(single).decision == Decision.ADMIT
+    assert p.submittable("task1").cid == "c2"
+
+def test_pipeline_rejects_failed_hard_gate_and_missing_card():
+    p = Pipeline()
+    bad_gate = Candidate("c3", "task1", None, "x", [GateResult("anticheat", False)], 9.0, _good_card())
+    assert p.review(bad_gate).decision == Decision.REJECT
+    no_card = Candidate("c4", "task1", None, "x", [GateResult("entry", True)], 9.0, ReleaseCard())
+    assert p.review(no_card).decision == Decision.REJECT
+
+def test_pipeline_rollback_when_not_better():
+    p = Pipeline()
+    p.review(Candidate("base", "task1", None, "init", [GateResult("entry", True)], 5.0, _good_card()))
+    worse = Candidate("c5", "task1", "base", "tweak", [GateResult("entry", True)], 4.0, _good_card())
+    assert p.review(worse).decision == Decision.ROLLBACK
+    assert p.submittable("task1").cid == "base"   # 保留父代
 
 
 if __name__ == "__main__":

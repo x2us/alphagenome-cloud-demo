@@ -9,6 +9,7 @@ faithful, fail-closed surrogate of the online grader:
 See ``utility.evaluate`` to compose gates and ``demo.py`` for a worked example.
 """
 
-from . import anticheat, ef1, log_truth, utility
+from . import anticheat, contract, ef1, log_truth, pipeline, release_card, submission, utility
 
-__all__ = ["utility", "ef1", "anticheat", "log_truth"]
+__all__ = ["utility", "ef1", "anticheat", "log_truth",
+           "submission", "contract", "release_card", "pipeline"]
